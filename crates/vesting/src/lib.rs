@@ -211,6 +211,47 @@ pub trait SorobanForgeVesting {
     ) -> Result<VestingStatus, soroban_forge_shared_utils::ForgeError>;
 }
 
+/// Events emitted by the vesting contract.
+///
+/// Mirrors escrow's event coverage: one event per state-changing entrypoint,
+/// with identifiers in topics and amounts/addresses in the data payload.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VestingEvent {
+    /// A linear schedule was created.
+    ScheduleCreated {
+        schedule_id: u64,
+        beneficiary: Address,
+        token: Address,
+        total_amount: i128,
+        cliff: u64,
+        duration: u64,
+        start: u64,
+    },
+    /// A tranche schedule was created.
+    TrancheScheduleCreated {
+        schedule_id: u64,
+        beneficiary: Address,
+        token: Address,
+        total_amount: i128,
+        tranches: u32,
+        start: u64,
+    },
+    /// A claim was settled and tokens were transferred.
+    Claimed {
+        schedule_id: u64,
+        beneficiary: Address,
+        amount: i128,
+        claimed_total: i128,
+    },
+    /// A schedule was revoked (reserved; not yet reachable).
+    Revoked {
+        schedule_id: u64,
+        beneficiary: Address,
+        unvested_amount: i128,
+    },
+}
+
 /// Lifecycle state of a vesting schedule.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,6 +401,18 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(id), &schedule);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("created"), id),
+            VestingEvent::ScheduleCreated {
+                schedule_id: id,
+                beneficiary: schedule.beneficiary.clone(),
+                token: schedule.token.clone(),
+                total_amount: schedule.total_amount,
+                cliff: schedule.cliff,
+                duration: schedule.duration,
+                start: schedule.start,
+            },
+        );
         Ok(id)
     }
 
@@ -400,6 +453,17 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::TrancheSchedule(id), &schedule);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("tranche"), id),
+            VestingEvent::TrancheScheduleCreated {
+                schedule_id: id,
+                beneficiary: schedule.beneficiary.clone(),
+                token: schedule.token.clone(),
+                total_amount: schedule.total_amount,
+                tranches: schedule.tranches.len(),
+                start: schedule.start,
+            },
+        );
         Ok(id)
     }
 
@@ -505,6 +569,15 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(schedule_id), &schedule);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("claimed"), schedule_id),
+            VestingEvent::Claimed {
+                schedule_id,
+                beneficiary: schedule.beneficiary.clone(),
+                amount,
+                claimed_total: schedule.claimed,
+            },
+        );
         Ok(amount)
     }
 
@@ -529,6 +602,15 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::TrancheSchedule(schedule_id), &schedule);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("claimed"), schedule_id),
+            VestingEvent::Claimed {
+                schedule_id,
+                beneficiary: schedule.beneficiary.clone(),
+                amount,
+                claimed_total: schedule.claimed,
+            },
+        );
         Ok(amount)
     }
 
