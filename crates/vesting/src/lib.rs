@@ -69,6 +69,7 @@
 //! Authorization model:
 //! - `create_schedule` and `create_tranche_schedule` require the beneficiary.
 //! - `claim` requires the beneficiary.
+//! - `revoke` requires the creator.
 //! - `claimable`, `get_status`, `get_schedule`, and `get_tranche_schedule`
 //!   are read-only views.
 //!
@@ -85,8 +86,9 @@
 //! is the outer atomicity guarantee: any `Err` returned from `claim` reverts
 //! the whole invocation, including sub-invocations.
 //!
-//! The `Revoked` status is reserved for a revocation method that lands in a
-//! follow-up; it is not reachable through the current public interface.
+//! A creator may revoke a schedule through `revoke`, which applies a
+//! [`RevocationPolicy`] to claw back tokens; the `Revoked` status is set on
+//! the schedule and further claims are rejected.
 
 #[cfg(test)]
 extern crate std;
@@ -150,6 +152,27 @@ pub trait SorobanForgeVesting {
         token: Address,
         tranches: Vec<Tranche>,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Revoke a vesting schedule, clawing back tokens per `policy`.
+    ///
+    /// Requires the schedule's creator. The cliff period must have been
+    /// reached (revocation before the cliff is rejected). `FullClawback`
+    /// returns every unclaimed token to the creator; `KeepUnvested` returns
+    /// only the unvested portion, leaving already-vested tokens claimable by
+    /// the beneficiary. The schedule transitions to [`VestingStatus::Revoked`]
+    /// and further claims are rejected.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no schedule with this id.
+    /// * [`ForgeError::Unauthorized`] — caller is not the creator.
+    /// * [`ForgeError::InvalidInput`] — revocation attempted before the cliff,
+    ///   or the schedule is already fully vested/revoked.
+    fn revoke(
+        env: Env,
+        schedule_id: u64,
+        policy: RevocationPolicy,
+    ) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 
     /// Read the full linear schedule record (read-only view).
     ///
@@ -225,6 +248,17 @@ pub enum VestingStatus {
     Revoked,
 }
 
+/// Policy applied when a schedule is revoked.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevocationPolicy {
+    /// All unclaimed tokens are returned to the creator.
+    FullClawback,
+    /// Only the unvested portion is returned; already-vested tokens remain
+    /// claimable by the beneficiary.
+    KeepUnvested,
+}
+
 /// A single token-vesting schedule.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -243,6 +277,8 @@ pub struct VestingSchedule {
     pub duration: u64,
     /// Amount already claimed by the beneficiary.
     pub claimed: i128,
+    /// Address authorized to revoke this schedule.
+    pub creator: Address,
     /// Current lifecycle state.
     pub status: VestingStatus,
 }
@@ -286,6 +322,8 @@ pub struct TrancheSchedule {
     pub tranches: Vec<Tranche>,
     /// Amount already claimed by the beneficiary.
     pub claimed: i128,
+    /// Address authorized to revoke this schedule.
+    pub creator: Address,
     /// Current lifecycle state.
     pub status: VestingStatus,
 }
@@ -304,6 +342,8 @@ enum DataKey {
     TrancheSchedule(u64),
     /// Monotonic id counter, shared by both kinds.
     Count,
+    /// Address authorized to revoke a schedule.
+    Creator(u64),
 }
 
 /// A stored schedule of either kind, as returned by [`Vesting::load`].
@@ -345,6 +385,7 @@ impl Vesting {
 
         let id = Self::next_id(&env)?;
         let start = env.ledger().timestamp();
+        let creator = beneficiary.clone();
         let mut schedule = VestingSchedule {
             beneficiary,
             token,
@@ -353,6 +394,7 @@ impl Vesting {
             cliff,
             duration,
             claimed: 0,
+            creator: creator.clone(),
             status: VestingStatus::Locked,
         };
         // Derive the initial status from time (cliff == 0 starts `Vesting`).
@@ -360,6 +402,7 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::Schedule(id), &schedule);
+        env.storage().instance().set(&DataKey::Creator(id), &creator);
         Ok(id)
     }
 
@@ -385,6 +428,7 @@ impl Vesting {
 
         let id = Self::next_id(&env)?;
         let start = env.ledger().timestamp();
+        let creator = beneficiary.clone();
         let mut schedule = TrancheSchedule {
             beneficiary,
             token,
@@ -392,6 +436,7 @@ impl Vesting {
             start,
             tranches,
             claimed: 0,
+            creator: creator.clone(),
             status: VestingStatus::Locked,
         };
         // Derive the initial status from time (a table starting at 0 begins
@@ -400,6 +445,7 @@ impl Vesting {
         env.storage()
             .instance()
             .set(&DataKey::TrancheSchedule(id), &schedule);
+        env.storage().instance().set(&DataKey::Creator(id), &creator);
         Ok(id)
     }
 
@@ -462,6 +508,93 @@ impl Vesting {
         }
     }
 
+    /// Revoke a schedule, clawing back tokens per `policy`.
+    ///
+    /// Requires the creator. Rejects revocation before the cliff (or before
+    /// the first tranche unlock) and revocation of an already-completed or
+    /// already-revoked schedule. On success the schedule is marked
+    /// [`VestingStatus::Revoked`] and the clawed-back amount is transferred
+    /// from this contract to the creator.
+    pub fn revoke(
+        env: Env,
+        schedule_id: u64,
+        policy: RevocationPolicy,
+    ) -> Result<(), ForgeError> {
+        let now = env.ledger().timestamp();
+        let creator: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Creator(schedule_id))
+            .ok_or(ForgeError::NotFound)?;
+        creator.require_auth();
+
+        match Self::load(&env, schedule_id)? {
+            Stored::Linear(mut schedule) => {
+                if schedule.status == VestingStatus::Revoked {
+                    return Err(ForgeError::InvalidInput);
+                }
+                let cliff_time = schedule
+                    .start
+                    .checked_add(schedule.cliff)
+                    .ok_or(ForgeError::ArithmeticOverflow)?;
+                if now < cliff_time {
+                    return Err(ForgeError::InvalidInput);
+                }
+                let vested = Self::vested_amount(&schedule, now)?;
+                let clawback = match policy {
+                    RevocationPolicy::FullClawback => schedule
+                        .total_amount
+                        .checked_sub(schedule.claimed)
+                        .ok_or(ForgeError::ArithmeticOverflow)?,
+                    RevocationPolicy::KeepUnvested => schedule
+                        .total_amount
+                        .checked_sub(vested)
+                        .ok_or(ForgeError::ArithmeticOverflow)?,
+                };
+                if clawback > 0 {
+                    transfer_from_contract(&env, &schedule.token, &creator, clawback)?;
+                }
+                schedule.status = VestingStatus::Revoked;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Schedule(schedule_id), &schedule);
+                Ok(())
+            }
+            Stored::Tranche(mut schedule) => {
+                if schedule.status == VestingStatus::Revoked {
+                    return Err(ForgeError::InvalidInput);
+                }
+                let unlocked = Self::tranche_unlocked(&schedule, now)?;
+                let first_offset = schedule
+                    .tranches
+                    .get(0)
+                    .map(|t| t.unlock_at)
+                    .unwrap_or(0);
+                if Self::elapsed_since(schedule.start, now) < first_offset {
+                    return Err(ForgeError::InvalidInput);
+                }
+                let clawback = match policy {
+                    RevocationPolicy::FullClawback => schedule
+                        .total_amount
+                        .checked_sub(schedule.claimed)
+                        .ok_or(ForgeError::ArithmeticOverflow)?,
+                    RevocationPolicy::KeepUnvested => schedule
+                        .total_amount
+                        .checked_sub(unlocked)
+                        .ok_or(ForgeError::ArithmeticOverflow)?,
+                };
+                if clawback > 0 {
+                    transfer_from_contract(&env, &schedule.token, &creator, clawback)?;
+                }
+                schedule.status = VestingStatus::Revoked;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::TrancheSchedule(schedule_id), &schedule);
+                Ok(())
+            }
+        }
+    }
+
     /// Load a schedule of either kind by id.
     ///
     /// The two kinds occupy distinct [`DataKey`] variants under one id
@@ -493,6 +626,9 @@ impl Vesting {
         mut schedule: VestingSchedule,
         now: u64,
     ) -> Result<i128, ForgeError> {
+        if schedule.status == VestingStatus::Revoked {
+            return Err(ForgeError::InvalidInput);
+        }
         let amount = Self::claimable_amount(&schedule, now)?;
         if !Self::authorize_and_pay(env, &schedule.beneficiary, &schedule.token, amount)? {
             return Ok(0);
@@ -517,6 +653,9 @@ impl Vesting {
         mut schedule: TrancheSchedule,
         now: u64,
     ) -> Result<i128, ForgeError> {
+        if schedule.status == VestingStatus::Revoked {
+            return Err(ForgeError::InvalidInput);
+        }
         let amount = Self::tranche_claimable(&schedule, now)?;
         if !Self::authorize_and_pay(env, &schedule.beneficiary, &schedule.token, amount)? {
             return Ok(0);
@@ -544,8 +683,6 @@ impl Vesting {
         token: &Address,
         amount: i128,
     ) -> Result<bool, ForgeError> {
-        // NOTE: when a revocation method lands, the claim paths must be
-        // gated on `status != Revoked`; the status is currently unreachable.
         beneficiary.require_auth();
         if amount == 0 {
             return Ok(false);
